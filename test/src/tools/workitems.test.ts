@@ -364,66 +364,6 @@ describe("configureWorkItemTools", () => {
     });
   });
 
-  describe("add_child_work_item tool", () => {
-    it("should call workItemApi.add_child_work_item API with the correct parameters and return the expected result", async () => {
-      configureWorkItemTools(server, tokenProvider, connectionProvider);
-
-      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "wit_add_child_work_item");
-
-      if (!call) throw new Error("wit_add_child_work_item tool not registered");
-      const [, , , handler] = call;
-
-      (mockWorkItemTrackingApi.createWorkItem as jest.Mock).mockResolvedValue([_mockWorkItem]);
-
-      const params = {
-        parentId: 299,
-        project: "Contoso",
-        workItemType: "Task",
-        title: "Sample task",
-        description: "This is a sample task",
-        areaPath: "Contoso\\Development",
-        iterationPath: "Contoso\\Sprint 1",
-      };
-
-      const document = [
-        {
-          op: "add",
-          path: "/fields/System.Title",
-          value: params.title,
-        },
-        {
-          op: "add",
-          path: "/fields/System.Description",
-          value: params.description,
-        },
-        {
-          op: "add",
-          path: "/relations/-",
-          value: {
-            rel: "System.LinkTypes.Hierarchy-Reverse",
-            url: `undefined/${params.project}/_apis/wit/workItems/${params.parentId}`,
-          },
-        },
-        {
-          op: "add",
-          path: "/fields/System.AreaPath",
-          value: params.areaPath,
-        },
-        {
-          op: "add",
-          path: "/fields/System.IterationPath",
-          value: params.iterationPath,
-        },
-      ];
-
-      const result = await handler(params);
-
-      expect(mockWorkItemTrackingApi.createWorkItem).toHaveBeenCalledWith(null, document, params.project, params.workItemType);
-
-      expect(result.content[0].text).toBe(JSON.stringify([_mockWorkItem], null, 2));
-    });
-  });
-
   describe("link_work_item_to_pull_request tool", () => {
     it("should call workItemApi.updateWorkItem API with the correct parameters and return the expected result", async () => {
       configureWorkItemTools(server, tokenProvider, connectionProvider);

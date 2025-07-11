@@ -5,7 +5,7 @@ import { AccessToken } from "@azure/identity";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { apiVersion } from "../utils.js";
 import { WebApi } from "azure-devops-node-api";
-import { BuildQueryOrder, DefinitionQueryOrder } from "azure-devops-node-api/interfaces/BuildInterfaces.js";
+import { BuildQueryOrder, DefinitionQueryOrder, TaskResult, TimelineRecordState } from "azure-devops-node-api/interfaces/BuildInterfaces.js";
 import { z } from "zod";
 import { StageUpdateType } from "azure-devops-node-api/interfaces/BuildInterfaces.js";
 
@@ -192,7 +192,7 @@ function configureBuildTools(server: McpServer, tokenProvider: () => Promise<Acc
 
   server.tool(
     BUILD_TOOLS.get_log,
-    "Retrieves the logs for a specific build.",
+    "Retrieves the logs for a specific build along with step names and their status (passed, failed, skipped, etc.).",
     {
       project: z.string().describe("Project ID or name to get the build log for"),
       buildId: z.number().describe("ID of the build to get the log for"),
@@ -200,10 +200,73 @@ function configureBuildTools(server: McpServer, tokenProvider: () => Promise<Acc
     async ({ project, buildId }) => {
       const connection = await connectionProvider();
       const buildApi = await connection.getBuildApi();
-      const logs = await buildApi.getBuildLogs(project, buildId);
+      
+      // Get both logs and timeline information
+      const [logs, timeline] = await Promise.all([
+        buildApi.getBuildLogs(project, buildId),
+        buildApi.getBuildTimeline(project, buildId)
+      ]);
+
+      // Create a map of log IDs to their corresponding timeline records (steps)
+      const logToStepMap = new Map();
+      const steps = [];
+      
+      if (timeline && timeline.records) {
+        for (const record of timeline.records) {
+          if (record.log && record.log.id) {
+            logToStepMap.set(record.log.id, record);
+          }
+          
+          // Include all task/step records
+          if (record.type === 'Task' || record.type === 'Job' || record.type === 'Stage') {
+            steps.push({
+              id: record.id,
+              name: record.name,
+              type: record.type,
+              state: record.state, // InProgress, Completed, etc.
+              result: record.result, // Succeeded, Failed, Skipped, etc.
+              startTime: record.startTime,
+              finishTime: record.finishTime,
+              logId: record.log?.id,
+              parentId: record.parentId,
+              order: record.order
+            });
+          }
+        }
+      }
+
+      // Enhance logs with step information
+      const enhancedLogs = logs?.map(log => {
+        const step = logToStepMap.get(log.id);
+        return {
+          ...log,
+          stepInfo: step ? {
+            stepName: step.name,
+            stepType: step.type,
+            state: step.state,
+            result: step.result,
+            startTime: step.startTime,
+            finishTime: step.finishTime
+          } : null
+        };
+      });
+
+      const response = {
+        logs: enhancedLogs || [],
+        steps: steps,
+        buildId: buildId,
+        summary: {
+          totalLogs: logs?.length || 0,
+          totalSteps: steps.length,
+          passedSteps: steps.filter(s => s.result === TaskResult.Succeeded).length,
+          failedSteps: steps.filter(s => s.result === TaskResult.Failed).length,
+          skippedSteps: steps.filter(s => s.result === TaskResult.Skipped).length,
+          inProgressSteps: steps.filter(s => s.state === TimelineRecordState.InProgress).length
+        }
+      };
 
       return {
-        content: [{ type: "text", text: JSON.stringify(logs, null, 2) }],
+        content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
       };
     }
   );

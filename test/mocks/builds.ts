@@ -89,3 +89,44 @@ export const mockUpdateBuildStageResponse = {
   name: "Build",
   forceRetryAllJobs: false,
 };
+
+export const mockBuildTimeline = {
+  records: [
+    {
+      id: "record1",
+      name: "Build Stage",
+      type: "Stage",
+      state: 2, // Completed
+      result: 0, // Succeeded
+      startTime: "2025-01-07T10:00:00Z",
+      finishTime: "2025-01-07T10:05:00Z",
+      log: { id: 1 },
+      parentId: null,
+      order: 1,
+    },
+    {
+      id: "record2",
+      name: "NuGet restore",
+      type: "Task",
+      state: 2, // Completed
+      result: 0, // Succeeded
+      startTime: "2025-01-07T10:01:00Z",
+      finishTime: "2025-01-07T10:02:00Z",
+      log: { id: 2 },
+      parentId: "record1",
+      order: 2,
+    },
+    {
+      id: "record3",
+      name: "Run Tests",
+      type: "Task",
+      state: 2, // Completed
+      result: 2, // Failed
+      startTime: "2025-01-07T10:03:00Z",
+      finishTime: "2025-01-07T10:04:00Z",
+      log: { id: 3 },
+      parentId: "record1",
+      order: 3,
+    },
+  ],
+};

@@ -2,10 +2,11 @@ import { AccessToken } from "@azure/identity";
 import { describe, expect, it, beforeEach } from "@jest/globals";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebApi } from "azure-devops-node-api";
+import { TaskResult, TimelineRecordState } from "azure-devops-node-api/interfaces/BuildInterfaces.js";
 import { StageUpdateType } from "azure-devops-node-api/interfaces/BuildInterfaces.js";
 import { configureBuildTools } from "../../../src/tools/builds";
 import { apiVersion } from "../../../src/utils.js";
-import { mockUpdateBuildStageResponse } from "../../mocks/builds";
+import { mockUpdateBuildStageResponse, mockBuildLogs, mockBuildTimeline } from "../../mocks/builds";
 
 // Mock fetch globally
 global.fetch = jest.fn() as jest.MockedFunction<typeof fetch>;
@@ -216,6 +217,66 @@ describe("configureBuildTools", () => {
           }),
         })
       );
+    });
+  });
+
+  describe("get_log tool", () => {
+    it("should retrieve logs with step information and status", async () => {
+      configureBuildTools(server, tokenProvider, connectionProvider);
+      const call = (server.tool as jest.Mock).mock.calls.find(([toolName]) => toolName === "build_get_log");
+      if (!call) throw new Error("build_get_log tool not registered");
+      const [, , , handler] = call;
+
+      // Mock the build API methods
+      const mockBuildApi = {
+        getBuildLogs: jest.fn().mockResolvedValue(mockBuildLogs),
+        getBuildTimeline: jest.fn().mockResolvedValue(mockBuildTimeline)
+      };
+      mockConnection.getBuildApi.mockResolvedValue(mockBuildApi);
+
+      const params = {
+        project: "test-project",
+        buildId: 123
+      };
+
+      const result = await handler(params);
+      const response = JSON.parse(result.content[0].text);
+
+      // Verify API calls
+      expect(mockBuildApi.getBuildLogs).toHaveBeenCalledWith("test-project", 123);
+      expect(mockBuildApi.getBuildTimeline).toHaveBeenCalledWith("test-project", 123);
+
+      // Verify response structure
+      expect(response).toHaveProperty("logs");
+      expect(response).toHaveProperty("steps");
+      expect(response).toHaveProperty("summary");
+      expect(response).toHaveProperty("buildId", 123);
+
+      // Verify enhanced logs with step information
+      expect(response.logs).toHaveLength(2);
+      expect(response.logs[0]).toHaveProperty("stepInfo");
+      expect(response.logs[0].stepInfo).toHaveProperty("stepName", "Build Stage");
+      expect(response.logs[0].stepInfo).toHaveProperty("state", TimelineRecordState.Completed);
+      expect(response.logs[0].stepInfo).toHaveProperty("result", TaskResult.Succeeded);
+
+      // Verify steps information
+      expect(response.steps).toHaveLength(3); // 1 Stage + 2 Tasks
+      expect(response.steps[0]).toMatchObject({
+        name: "Build Stage",
+        type: "Stage",
+        state: TimelineRecordState.Completed,
+        result: TaskResult.Succeeded
+      });
+
+      // Verify summary
+      expect(response.summary).toMatchObject({
+        totalLogs: 2,
+        totalSteps: 3,
+        passedSteps: 2,
+        failedSteps: 1,
+        skippedSteps: 0,
+        inProgressSteps: 0
+      });
     });
   });
 });

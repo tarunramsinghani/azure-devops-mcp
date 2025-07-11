@@ -99,7 +99,7 @@ Interact with these Azure DevOps services:
 - **build_get_definitions**: Retrieves a list of build definitions for a given project.
 - **build_get_definition_revisions**: Retrieves a list of revisions for a specific build definition.
 - **build_get_builds**: Retrieves a list of builds for a given project.
-- **build_get_log**: Retrieves the logs for a specific build.
+- **build_get_log**: Retrieves the logs for a specific build along with step names and their status (passed, failed, skipped, etc.).
 - **build_get_log_by_id**: Get a specific build log by log ID.
 - **build_get_changes**: Get the changes associated with a specific build.
 - **build_run_build**: Triggers a new build for a specified definition.

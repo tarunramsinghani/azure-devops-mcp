@@ -73,6 +73,18 @@ async function getAzureDevOpsToken(): Promise<AccessToken> {
 
 function getAzureDevOpsClient(userAgentComposer: UserAgentComposer): () => Promise<azdev.WebApi> {
   return async () => {
+    // Use PAT authentication if available
+    if (process.env.AZURE_DEVOPS_PAT) {
+      const authHandler = azdev.getPersonalAccessTokenHandler(process.env.AZURE_DEVOPS_PAT);
+      const connection = new azdev.WebApi(orgUrl, authHandler, undefined, {
+        productName: "AzureDevOps.MCP",
+        productVersion: packageVersion,
+        userAgent: userAgentComposer.userAgent,
+      });
+      return connection;
+    }
+
+    // Fall back to Azure authentication
     const token = await getAzureDevOpsToken();
     const authHandler = azdev.getBearerHandler(token.token);
     const connection = new azdev.WebApi(orgUrl, authHandler, undefined, {

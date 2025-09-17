@@ -6,34 +6,52 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import * as azdev from "azure-devops-node-api";
-import { AccessToken, DefaultAzureCredential } from "@azure/identity";
+import { AccessToken, AzureCliCredential, ChainedTokenCredential, DefaultAzureCredential, TokenCredential } from "@azure/identity";
+import yargs from "yargs";
+import { hideBin } from "yargs/helpers";
+
 import { configurePrompts } from "./prompts.js";
 import { configureAllTools } from "./tools.js";
-import { userAgent } from "./utils.js";
+import { UserAgentComposer } from "./useragent.js";
 import { packageVersion } from "./version.js";
-const args = process.argv.slice(2);
-if (args.length === 0) {
-  console.error("Usage: mcp-server-azuredevops <organization_name>");
-  process.exit(1);
-}
+import { DomainsManager } from "./shared/domains.js";
 
-export const orgName = args[0];
+// Parse command line arguments using yargs
+const argv = yargs(hideBin(process.argv))
+  .scriptName("mcp-server-azuredevops")
+  .usage("Usage: $0 <organization> [options]")
+  .version(packageVersion)
+  .command("$0 <organization> [options]", "Azure DevOps MCP Server", (yargs) => {
+    yargs.positional("organization", {
+      describe: "Azure DevOps organization name",
+      type: "string",
+      demandOption: true,
+    });
+  })
+  .option("domains", {
+    alias: "d",
+    describe: "Domain(s) to enable: 'all' for everything, or specific domains like 'repositories builds work'. Defaults to 'all'.",
+    type: "string",
+    array: true,
+    default: "all",
+  })
+  .option("tenant", {
+    alias: "t",
+    describe: "Azure tenant ID (optional, required for multi-tenant scenarios)",
+    type: "string",
+  })
+  .help()
+  .parseSync();
+
+const tenantId = argv.tenant;
+
+export const orgName = argv.organization as string;
 const orgUrl = "https://dev.azure.com/" + orgName;
 
-async function getAzureDevOpsToken(): Promise<AccessToken> {
-<<<<<<< Updated upstream
-  process.env.AZURE_TOKEN_CREDENTIALS = "dev";
-  const credential = new DefaultAzureCredential(); // CodeQL [SM05138] resolved by explicitly setting AZURE_TOKEN_CREDENTIALS
-=======
-  // If PAT is available, we don't need to get an Azure token, but we still need to return an AccessToken-like object
-  if (process.env.AZURE_DEVOPS_PAT) {
-    // Return a mock AccessToken since we'll use Basic auth instead
-    return {
-      token: process.env.AZURE_DEVOPS_PAT,
-      expiresOnTimestamp: Date.now() + 3600000 // 1 hour from now
-    };
-  }
+const domainsManager = new DomainsManager(argv.domains);
+export const enabledDomains = domainsManager.getEnabledDomains();
 
+async function getAzureDevOpsToken(): Promise<AccessToken> {
   if (process.env.ADO_MCP_AZURE_TOKEN_CREDENTIALS) {
     process.env.AZURE_TOKEN_CREDENTIALS = process.env.ADO_MCP_AZURE_TOKEN_CREDENTIALS;
   } else {
@@ -46,36 +64,15 @@ async function getAzureDevOpsToken(): Promise<AccessToken> {
     credential = new ChainedTokenCredential(azureCliCredential, credential);
   }
 
->>>>>>> Stashed changes
   const token = await credential.getToken("499b84ac-1321-427f-aa17-267ca6975798/.default");
+  if (!token) {
+    throw new Error("Failed to obtain Azure DevOps token. Ensure you have Azure CLI logged in or another token source setup correctly.");
+  }
   return token;
 }
 
-<<<<<<< Updated upstream
-async function getAzureDevOpsClient(): Promise<azdev.WebApi> {
-  const token = await getAzureDevOpsToken();
-  const authHandler = azdev.getBearerHandler(token.token);
-  const connection = new azdev.WebApi(orgUrl, authHandler, undefined, {
-    productName: "AzureDevOps.MCP",
-    productVersion: packageVersion,
-    userAgent: userAgent,
-  });
-  return connection;
-=======
 function getAzureDevOpsClient(userAgentComposer: UserAgentComposer): () => Promise<azdev.WebApi> {
   return async () => {
-    // Use PAT authentication if available
-    if (process.env.AZURE_DEVOPS_PAT) {
-      const authHandler = azdev.getPersonalAccessTokenHandler(process.env.AZURE_DEVOPS_PAT);
-      const connection = new azdev.WebApi(orgUrl, authHandler, undefined, {
-        productName: "AzureDevOps.MCP",
-        productVersion: packageVersion,
-        userAgent: userAgentComposer.userAgent,
-      });
-      return connection;
-    }
-
-    // Fall back to Azure authentication
     const token = await getAzureDevOpsToken();
     const authHandler = azdev.getBearerHandler(token.token);
     const connection = new azdev.WebApi(orgUrl, authHandler, undefined, {
@@ -85,7 +82,6 @@ function getAzureDevOpsClient(userAgentComposer: UserAgentComposer): () => Promi
     });
     return connection;
   };
->>>>>>> Stashed changes
 }
 
 async function main() {
@@ -94,9 +90,14 @@ async function main() {
     version: packageVersion,
   });
 
+  const userAgentComposer = new UserAgentComposer(packageVersion);
+  server.server.oninitialized = () => {
+    userAgentComposer.appendMcpClientInfo(server.server.getClientVersion());
+  };
+
   configurePrompts(server);
 
-  configureAllTools(server, getAzureDevOpsToken, getAzureDevOpsClient);
+  configureAllTools(server, getAzureDevOpsToken, getAzureDevOpsClient(userAgentComposer), () => userAgentComposer.userAgent, enabledDomains);
 
   const transport = new StdioServerTransport();
   await server.connect(transport);

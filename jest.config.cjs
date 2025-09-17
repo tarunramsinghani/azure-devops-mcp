@@ -21,7 +21,17 @@ module.exports = {
   coverageDirectory: "coverage",
 
   // Coverage report formats
-  coverageReporters: ["text", "lcov"],
+  coverageReporters: ["text", "lcov", "json-summary"],
+
+  // Coverage thresholds
+  coverageThreshold: {
+    global: {
+      branches: 40,
+      functions: 40,
+      lines: 40,
+      statements: 40,
+    },
+  },
 
   // Module file extensions for importing
   moduleFileExtensions: ["ts", "js"],
@@ -34,5 +44,6 @@ module.exports = {
   moduleNameMapper: {
     "^(.+)/version\\.js$": "$1/version.ts",
     "^(.+)/utils\\.js$": "$1/utils.ts",
+    "^(.+)/auth\\.js$": "$1/auth.ts",
   },
 };

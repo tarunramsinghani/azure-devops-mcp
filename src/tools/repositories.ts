@@ -6,6 +6,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebApi } from "azure-devops-node-api";
 import {
   GitRef,
+  GitForkRef,
   PullRequestStatus,
   GitQueryCommitsCriteria,
   GitVersionType,
@@ -13,10 +14,13 @@ import {
   GitPullRequestQuery,
   GitPullRequestQueryInput,
   GitPullRequestQueryType,
+  CommentThreadContext,
+  CommentThreadStatus,
 } from "azure-devops-node-api/interfaces/GitInterfaces.js";
 import { z } from "zod";
-import { getCurrentUserDetails } from "./auth.js";
+import { getCurrentUserDetails, getUserIdFromEmail } from "./auth.js";
 import { GitRepository } from "azure-devops-node-api/interfaces/TfvcInterfaces.js";
+import { getEnumKeys } from "../utils.js";
 
 const REPO_TOOLS = {
   list_repos_by_project: "repo_list_repos_by_project",
@@ -30,8 +34,10 @@ const REPO_TOOLS = {
   get_branch_by_name: "repo_get_branch_by_name",
   get_pull_request_by_id: "repo_get_pull_request_by_id",
   create_pull_request: "repo_create_pull_request",
-  update_pull_request_status: "repo_update_pull_request_status",
+  update_pull_request: "repo_update_pull_request",
+  update_pull_request_reviewers: "repo_update_pull_request_reviewers",
   reply_to_comment: "repo_reply_to_comment",
+  create_pull_request_thread: "repo_create_pull_request_thread",
   resolve_comment: "repo_resolve_comment",
   search_commits: "repo_search_commits",
   list_pull_requests_by_commits: "repo_list_pull_requests_by_commits",
@@ -46,17 +52,38 @@ function branchesFilterOutIrrelevantProperties(branches: GitRef[], top: number) 
     .slice(0, top);
 }
 
+/**
+ * Trims comment data to essential properties, filtering out deleted comments
+ * @param comments Array of comments to trim (can be undefined/null)
+ * @returns Array of trimmed comment objects with essential properties only
+ */
+function trimComments(comments: any[] | undefined | null) {
+  return comments
+    ?.filter((comment) => !comment.isDeleted) // Exclude deleted comments
+    ?.map((comment) => ({
+      id: comment.id,
+      author: {
+        displayName: comment.author?.displayName,
+        uniqueName: comment.author?.uniqueName,
+      },
+      content: comment.content,
+      publishedDate: comment.publishedDate,
+      lastUpdatedDate: comment.lastUpdatedDate,
+      lastContentUpdatedDate: comment.lastContentUpdatedDate,
+    }));
+}
+
 function pullRequestStatusStringToInt(status: string): number {
   switch (status) {
-    case "abandoned":
+    case "Abandoned":
       return PullRequestStatus.Abandoned.valueOf();
-    case "active":
+    case "Active":
       return PullRequestStatus.Active.valueOf();
-    case "all":
+    case "All":
       return PullRequestStatus.All.valueOf();
-    case "completed":
+    case "Completed":
       return PullRequestStatus.Completed.valueOf();
-    case "notSet":
+    case "NotSet":
       return PullRequestStatus.NotSet.valueOf();
     default:
       throw new Error(`Unknown pull request status: ${status}`);
@@ -70,7 +97,7 @@ function filterReposByName(repositories: GitRepository[], repoNameFilter: string
   return filteredByName;
 }
 
-function configureRepoTools(server: McpServer, tokenProvider: () => Promise<AccessToken>, connectionProvider: () => Promise<WebApi>) {
+function configureRepoTools(server: McpServer, tokenProvider: () => Promise<AccessToken>, connectionProvider: () => Promise<WebApi>, userAgentProvider: () => string) {
   server.tool(
     REPO_TOOLS.create_pull_request,
     "Create a new pull request.",
@@ -82,11 +109,20 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<Acce
       description: z.string().optional().describe("The description of the pull request. Optional."),
       isDraft: z.boolean().optional().default(false).describe("Indicates whether the pull request is a draft. Defaults to false."),
       workItems: z.string().optional().describe("Work item IDs to associate with the pull request, space-separated."),
+      forkSourceRepositoryId: z.string().optional().describe("The ID of the fork repository that the pull request originates from. Optional, used when creating a pull request from a fork."),
     },
-    async ({ repositoryId, sourceRefName, targetRefName, title, description, isDraft, workItems }) => {
+    async ({ repositoryId, sourceRefName, targetRefName, title, description, isDraft, workItems, forkSourceRepositoryId }) => {
       const connection = await connectionProvider();
       const gitApi = await connection.getGitApi();
       const workItemRefs = workItems ? workItems.split(" ").map((id) => ({ id: id.trim() })) : [];
+
+      const forkSource: GitForkRef | undefined = forkSourceRepositoryId
+        ? {
+            repository: {
+              id: forkSourceRepositoryId,
+            },
+          }
+        : undefined;
 
       const pullRequest = await gitApi.createPullRequest(
         {
@@ -96,6 +132,7 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<Acce
           description,
           isDraft,
           workItemRefs: workItemRefs,
+          forkSource,
         },
         repositoryId
       );
@@ -107,23 +144,86 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<Acce
   );
 
   server.tool(
-    REPO_TOOLS.update_pull_request_status,
-    "Update status of an existing pull request to active or abandoned.",
+    REPO_TOOLS.update_pull_request,
+    "Update a Pull Request by ID with specified fields.",
     {
       repositoryId: z.string().describe("The ID of the repository where the pull request exists."),
-      pullRequestId: z.number().describe("The ID of the pull request to be published."),
-      status: z.enum(["active", "abandoned"]).describe("The new status of the pull request. Can be 'active' or 'abandoned'."),
+      pullRequestId: z.number().describe("The ID of the pull request to update."),
+      title: z.string().optional().describe("The new title for the pull request."),
+      description: z.string().optional().describe("The new description for the pull request."),
+      isDraft: z.boolean().optional().describe("Whether the pull request should be a draft."),
+      targetRefName: z.string().optional().describe("The new target branch name (e.g., 'refs/heads/main')."),
+      status: z.enum(["Active", "Abandoned"]).optional().describe("The new status of the pull request. Can be 'Active' or 'Abandoned'."),
     },
-    async ({ repositoryId, pullRequestId, status }) => {
+    async ({ repositoryId, pullRequestId, title, description, isDraft, targetRefName, status }) => {
       const connection = await connectionProvider();
       const gitApi = await connection.getGitApi();
-      const statusValue = status === "active" ? 3 : 2;
 
-      const updatedPullRequest = await gitApi.updatePullRequest({ status: statusValue }, repositoryId, pullRequestId);
+      // Build update object with only provided fields
+      const updateRequest: {
+        title?: string;
+        description?: string;
+        isDraft?: boolean;
+        targetRefName?: string;
+        status?: number;
+      } = {};
+      if (title !== undefined) updateRequest.title = title;
+      if (description !== undefined) updateRequest.description = description;
+      if (isDraft !== undefined) updateRequest.isDraft = isDraft;
+      if (targetRefName !== undefined) updateRequest.targetRefName = targetRefName;
+      if (status !== undefined) {
+        updateRequest.status = status === "Active" ? PullRequestStatus.Active.valueOf() : PullRequestStatus.Abandoned.valueOf();
+      }
+
+      // Validate that at least one field is provided for update
+      if (Object.keys(updateRequest).length === 0) {
+        return {
+          content: [{ type: "text", text: "Error: At least one field (title, description, isDraft, targetRefName, or status) must be provided for update." }],
+          isError: true,
+        };
+      }
+
+      const updatedPullRequest = await gitApi.updatePullRequest(updateRequest, repositoryId, pullRequestId);
 
       return {
         content: [{ type: "text", text: JSON.stringify(updatedPullRequest, null, 2) }],
       };
+    }
+  );
+
+  server.tool(
+    REPO_TOOLS.update_pull_request_reviewers,
+    "Add or remove reviewers for an existing pull request.",
+    {
+      repositoryId: z.string().describe("The ID of the repository where the pull request exists."),
+      pullRequestId: z.number().describe("The ID of the pull request to update."),
+      reviewerIds: z.array(z.string()).describe("List of reviewer ids to add or remove from the pull request."),
+      action: z.enum(["add", "remove"]).describe("Action to perform on the reviewers. Can be 'add' or 'remove'."),
+    },
+    async ({ repositoryId, pullRequestId, reviewerIds, action }) => {
+      const connection = await connectionProvider();
+      const gitApi = await connection.getGitApi();
+
+      let updatedPullRequest;
+      if (action === "add") {
+        updatedPullRequest = await gitApi.createPullRequestReviewers(
+          reviewerIds.map((id) => ({ id: id })),
+          repositoryId,
+          pullRequestId
+        );
+
+        return {
+          content: [{ type: "text", text: JSON.stringify(updatedPullRequest, null, 2) }],
+        };
+      } else {
+        for (const reviewerId of reviewerIds) {
+          await gitApi.deletePullRequestReviewer(repositoryId, pullRequestId, reviewerId);
+        }
+
+        return {
+          content: [{ type: "text", text: `Reviewers with IDs ${reviewerIds.join(", ")} removed from pull request ${pullRequestId}.` }],
+        };
+      }
     }
   );
 
@@ -170,10 +270,20 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<Acce
       top: z.number().default(100).describe("The maximum number of pull requests to return."),
       skip: z.number().default(0).describe("The number of pull requests to skip."),
       created_by_me: z.boolean().default(false).describe("Filter pull requests created by the current user."),
+      created_by_user: z.string().optional().describe("Filter pull requests created by a specific user (provide email or unique name). Takes precedence over created_by_me if both are provided."),
       i_am_reviewer: z.boolean().default(false).describe("Filter pull requests where the current user is a reviewer."),
-      status: z.enum(["abandoned", "active", "all", "completed", "notSet"]).default("active").describe("Filter pull requests by status. Defaults to 'active'."),
+      user_is_reviewer: z
+        .string()
+        .optional()
+        .describe("Filter pull requests where a specific user is a reviewer (provide email or unique name). Takes precedence over i_am_reviewer if both are provided."),
+      status: z
+        .enum(getEnumKeys(PullRequestStatus) as [string, ...string[]])
+        .default("Active")
+        .describe("Filter pull requests by status. Defaults to 'Active'."),
+      sourceRefName: z.string().optional().describe("Filter pull requests from this source branch (e.g., 'refs/heads/feature-branch')."),
+      targetRefName: z.string().optional().describe("Filter pull requests into this target branch (e.g., 'refs/heads/main')."),
     },
-    async ({ repositoryId, top, skip, created_by_me, i_am_reviewer, status }) => {
+    async ({ repositoryId, top, skip, created_by_me, created_by_user, i_am_reviewer, user_is_reviewer, status, sourceRefName, targetRefName }) => {
       const connection = await connectionProvider();
       const gitApi = await connection.getGitApi();
 
@@ -183,20 +293,61 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<Acce
         repositoryId: string;
         creatorId?: string;
         reviewerId?: string;
+        sourceRefName?: string;
+        targetRefName?: string;
       } = {
         status: pullRequestStatusStringToInt(status),
         repositoryId: repositoryId,
       };
 
-      if (created_by_me || i_am_reviewer) {
-        const data = await getCurrentUserDetails(tokenProvider, connectionProvider);
-        const userId = data.authenticatedUser.id;
-        if (created_by_me) {
+      if (sourceRefName) {
+        searchCriteria.sourceRefName = sourceRefName;
+      }
+
+      if (targetRefName) {
+        searchCriteria.targetRefName = targetRefName;
+      }
+
+      if (created_by_user) {
+        try {
+          const userId = await getUserIdFromEmail(created_by_user, tokenProvider, connectionProvider, userAgentProvider);
           searchCriteria.creatorId = userId;
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Error finding user with email ${created_by_user}: ${error instanceof Error ? error.message : String(error)}`,
+              },
+            ],
+            isError: true,
+          };
         }
-        if (i_am_reviewer) {
-          searchCriteria.reviewerId = userId;
+      } else if (created_by_me) {
+        const data = await getCurrentUserDetails(tokenProvider, connectionProvider, userAgentProvider);
+        const userId = data.authenticatedUser.id;
+        searchCriteria.creatorId = userId;
+      }
+
+      if (user_is_reviewer) {
+        try {
+          const reviewerUserId = await getUserIdFromEmail(user_is_reviewer, tokenProvider, connectionProvider, userAgentProvider);
+          searchCriteria.reviewerId = reviewerUserId;
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Error finding reviewer with email ${user_is_reviewer}: ${error instanceof Error ? error.message : String(error)}`,
+              },
+            ],
+            isError: true,
+          };
         }
+      } else if (i_am_reviewer) {
+        const data = await getCurrentUserDetails(tokenProvider, connectionProvider, userAgentProvider);
+        const userId = data.authenticatedUser.id;
+        searchCriteria.reviewerId = userId;
       }
 
       const pullRequests = await gitApi.getPullRequests(
@@ -220,6 +371,8 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<Acce
         creationDate: pr.creationDate,
         title: pr.title,
         isDraft: pr.isDraft,
+        sourceRefName: pr.sourceRefName,
+        targetRefName: pr.targetRefName,
       }));
 
       return {
@@ -236,10 +389,20 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<Acce
       top: z.number().default(100).describe("The maximum number of pull requests to return."),
       skip: z.number().default(0).describe("The number of pull requests to skip."),
       created_by_me: z.boolean().default(false).describe("Filter pull requests created by the current user."),
+      created_by_user: z.string().optional().describe("Filter pull requests created by a specific user (provide email or unique name). Takes precedence over created_by_me if both are provided."),
       i_am_reviewer: z.boolean().default(false).describe("Filter pull requests where the current user is a reviewer."),
-      status: z.enum(["abandoned", "active", "all", "completed", "notSet"]).default("active").describe("Filter pull requests by status. Defaults to 'active'."),
+      user_is_reviewer: z
+        .string()
+        .optional()
+        .describe("Filter pull requests where a specific user is a reviewer (provide email or unique name). Takes precedence over i_am_reviewer if both are provided."),
+      status: z
+        .enum(getEnumKeys(PullRequestStatus) as [string, ...string[]])
+        .default("Active")
+        .describe("Filter pull requests by status. Defaults to 'Active'."),
+      sourceRefName: z.string().optional().describe("Filter pull requests from this source branch (e.g., 'refs/heads/feature-branch')."),
+      targetRefName: z.string().optional().describe("Filter pull requests into this target branch (e.g., 'refs/heads/main')."),
     },
-    async ({ project, top, skip, created_by_me, i_am_reviewer, status }) => {
+    async ({ project, top, skip, created_by_me, created_by_user, i_am_reviewer, user_is_reviewer, status, sourceRefName, targetRefName }) => {
       const connection = await connectionProvider();
       const gitApi = await connection.getGitApi();
 
@@ -248,19 +411,60 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<Acce
         status: number;
         creatorId?: string;
         reviewerId?: string;
+        sourceRefName?: string;
+        targetRefName?: string;
       } = {
         status: pullRequestStatusStringToInt(status),
       };
 
-      if (created_by_me || i_am_reviewer) {
-        const data = await getCurrentUserDetails(tokenProvider, connectionProvider);
-        const userId = data.authenticatedUser.id;
-        if (created_by_me) {
+      if (sourceRefName) {
+        gitPullRequestSearchCriteria.sourceRefName = sourceRefName;
+      }
+
+      if (targetRefName) {
+        gitPullRequestSearchCriteria.targetRefName = targetRefName;
+      }
+
+      if (created_by_user) {
+        try {
+          const userId = await getUserIdFromEmail(created_by_user, tokenProvider, connectionProvider, userAgentProvider);
           gitPullRequestSearchCriteria.creatorId = userId;
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Error finding user with email ${created_by_user}: ${error instanceof Error ? error.message : String(error)}`,
+              },
+            ],
+            isError: true,
+          };
         }
-        if (i_am_reviewer) {
-          gitPullRequestSearchCriteria.reviewerId = userId;
+      } else if (created_by_me) {
+        const data = await getCurrentUserDetails(tokenProvider, connectionProvider, userAgentProvider);
+        const userId = data.authenticatedUser.id;
+        gitPullRequestSearchCriteria.creatorId = userId;
+      }
+
+      if (user_is_reviewer) {
+        try {
+          const reviewerUserId = await getUserIdFromEmail(user_is_reviewer, tokenProvider, connectionProvider, userAgentProvider);
+          gitPullRequestSearchCriteria.reviewerId = reviewerUserId;
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Error finding reviewer with email ${user_is_reviewer}: ${error instanceof Error ? error.message : String(error)}`,
+              },
+            ],
+            isError: true,
+          };
         }
+      } else if (i_am_reviewer) {
+        const data = await getCurrentUserDetails(tokenProvider, connectionProvider, userAgentProvider);
+        const userId = data.authenticatedUser.id;
+        gitPullRequestSearchCriteria.reviewerId = userId;
       }
 
       const pullRequests = await gitApi.getPullRequestsByProject(
@@ -284,6 +488,8 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<Acce
         creationDate: pr.creationDate,
         title: pr.title,
         isDraft: pr.isDraft,
+        sourceRefName: pr.sourceRefName,
+        targetRefName: pr.targetRefName,
       }));
 
       return {
@@ -303,8 +509,9 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<Acce
       baseIteration: z.number().optional().describe("The base iteration ID for which to retrieve threads. Optional, defaults to the latest base iteration."),
       top: z.number().default(100).describe("The maximum number of threads to return."),
       skip: z.number().default(0).describe("The number of threads to skip."),
+      fullResponse: z.boolean().optional().default(false).describe("Return full thread JSON response instead of trimmed data."),
     },
-    async ({ repositoryId, pullRequestId, project, iteration, baseIteration, top, skip }) => {
+    async ({ repositoryId, pullRequestId, project, iteration, baseIteration, top, skip, fullResponse }) => {
       const connection = await connectionProvider();
       const gitApi = await connection.getGitApi();
 
@@ -312,8 +519,23 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<Acce
 
       const paginatedThreads = threads?.sort((a, b) => (a.id ?? 0) - (b.id ?? 0)).slice(skip, skip + top);
 
+      if (fullResponse) {
+        return {
+          content: [{ type: "text", text: JSON.stringify(paginatedThreads, null, 2) }],
+        };
+      }
+
+      // Return trimmed thread data focusing on essential information
+      const trimmedThreads = paginatedThreads?.map((thread) => ({
+        id: thread.id,
+        publishedDate: thread.publishedDate,
+        lastUpdatedDate: thread.lastUpdatedDate,
+        status: thread.status,
+        comments: trimComments(thread.comments),
+      }));
+
       return {
-        content: [{ type: "text", text: JSON.stringify(paginatedThreads, null, 2) }],
+        content: [{ type: "text", text: JSON.stringify(trimmedThreads, null, 2) }],
       };
     }
   );
@@ -328,8 +550,9 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<Acce
       project: z.string().optional().describe("Project ID or project name (optional)"),
       top: z.number().default(100).describe("The maximum number of comments to return."),
       skip: z.number().default(0).describe("The number of comments to skip."),
+      fullResponse: z.boolean().optional().default(false).describe("Return full comment JSON response instead of trimmed data."),
     },
-    async ({ repositoryId, pullRequestId, threadId, project, top, skip }) => {
+    async ({ repositoryId, pullRequestId, threadId, project, top, skip, fullResponse }) => {
       const connection = await connectionProvider();
       const gitApi = await connection.getGitApi();
 
@@ -338,8 +561,17 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<Acce
 
       const paginatedComments = comments?.sort((a, b) => (a.id ?? 0) - (b.id ?? 0)).slice(skip, skip + top);
 
+      if (fullResponse) {
+        return {
+          content: [{ type: "text", text: JSON.stringify(paginatedComments, null, 2) }],
+        };
+      }
+
+      // Return trimmed comment data focusing on essential information
+      const trimmedComments = trimComments(paginatedComments);
+
       return {
-        content: [{ type: "text", text: JSON.stringify(paginatedComments, null, 2) }],
+        content: [{ type: "text", text: JSON.stringify(trimmedComments, null, 2) }],
       };
     }
   );
@@ -350,11 +582,12 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<Acce
     {
       repositoryId: z.string().describe("The ID of the repository where the branches are located."),
       top: z.number().default(100).describe("The maximum number of branches to return. Defaults to 100."),
+      filterContains: z.string().optional().describe("Filter to find branches that contain this string in their name."),
     },
-    async ({ repositoryId, top }) => {
+    async ({ repositoryId, top, filterContains }) => {
       const connection = await connectionProvider();
       const gitApi = await connection.getGitApi();
-      const branches = await gitApi.getRefs(repositoryId, undefined);
+      const branches = await gitApi.getRefs(repositoryId, undefined, "heads/", undefined, undefined, undefined, undefined, undefined, filterContains);
 
       const filteredBranches = branchesFilterOutIrrelevantProperties(branches, top);
 
@@ -370,11 +603,12 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<Acce
     {
       repositoryId: z.string().describe("The ID of the repository where the branches are located."),
       top: z.number().default(100).describe("The maximum number of branches to return."),
+      filterContains: z.string().optional().describe("Filter to find branches that contain this string in their name."),
     },
-    async ({ repositoryId, top }) => {
+    async ({ repositoryId, top, filterContains }) => {
       const connection = await connectionProvider();
       const gitApi = await connection.getGitApi();
-      const branches = await gitApi.getRefs(repositoryId, undefined, undefined, undefined, undefined, true);
+      const branches = await gitApi.getRefs(repositoryId, undefined, "heads/", undefined, undefined, true, undefined, undefined, filterContains);
 
       const filteredBranches = branchesFilterOutIrrelevantProperties(branches, top);
 
@@ -418,8 +652,8 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<Acce
     async ({ repositoryId, branchName }) => {
       const connection = await connectionProvider();
       const gitApi = await connection.getGitApi();
-      const branches = await gitApi.getRefs(repositoryId);
-      const branch = branches?.find((branch) => branch.name === `refs/heads/${branchName}`);
+      const branches = await gitApi.getRefs(repositoryId, undefined, "heads/", false, false, undefined, false, undefined, branchName);
+      const branch = branches.find((branch) => branch.name === `refs/heads/${branchName}` || branch.name === branchName);
       if (!branch) {
         return {
           content: [
@@ -428,6 +662,7 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<Acce
               text: `Branch ${branchName} not found in repository ${repositoryId}`,
             },
           ],
+          isError: true,
         };
       }
       return {
@@ -442,11 +677,12 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<Acce
     {
       repositoryId: z.string().describe("The ID of the repository where the pull request is located."),
       pullRequestId: z.number().describe("The ID of the pull request to retrieve."),
+      includeWorkItemRefs: z.boolean().optional().default(false).describe("Whether to reference work items associated with the pull request."),
     },
-    async ({ repositoryId, pullRequestId }) => {
+    async ({ repositoryId, pullRequestId, includeWorkItemRefs }) => {
       const connection = await connectionProvider();
       const gitApi = await connection.getGitApi();
-      const pullRequest = await gitApi.getPullRequest(repositoryId, pullRequestId);
+      const pullRequest = await gitApi.getPullRequest(repositoryId, pullRequestId, undefined, undefined, undefined, undefined, undefined, includeWorkItemRefs);
       return {
         content: [{ type: "text", text: JSON.stringify(pullRequest, null, 2) }],
       };
@@ -462,14 +698,119 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<Acce
       threadId: z.number().describe("The ID of the thread to which the comment will be added."),
       content: z.string().describe("The content of the comment to be added."),
       project: z.string().optional().describe("Project ID or project name (optional)"),
+      fullResponse: z.boolean().optional().default(false).describe("Return full comment JSON response instead of a simple confirmation message."),
     },
-    async ({ repositoryId, pullRequestId, threadId, content, project }) => {
+    async ({ repositoryId, pullRequestId, threadId, content, project, fullResponse }) => {
       const connection = await connectionProvider();
       const gitApi = await connection.getGitApi();
       const comment = await gitApi.createComment({ content }, repositoryId, pullRequestId, threadId, project);
 
+      // Check if the comment was successfully created
+      if (!comment) {
+        return {
+          content: [{ type: "text", text: `Error: Failed to add comment to thread ${threadId}. The comment was not created successfully.` }],
+          isError: true,
+        };
+      }
+
+      if (fullResponse) {
+        return {
+          content: [{ type: "text", text: JSON.stringify(comment, null, 2) }],
+        };
+      }
+
       return {
-        content: [{ type: "text", text: JSON.stringify(comment, null, 2) }],
+        content: [{ type: "text", text: `Comment successfully added to thread ${threadId}.` }],
+      };
+    }
+  );
+
+  server.tool(
+    REPO_TOOLS.create_pull_request_thread,
+    "Creates a new comment thread on a pull request.",
+    {
+      repositoryId: z.string().describe("The ID of the repository where the pull request is located."),
+      pullRequestId: z.number().describe("The ID of the pull request where the comment thread exists."),
+      content: z.string().describe("The content of the comment to be added."),
+      project: z.string().optional().describe("Project ID or project name (optional)"),
+      filePath: z.string().optional().describe("The path of the file where the comment thread will be created. (optional)"),
+      status: z
+        .enum(getEnumKeys(CommentThreadStatus) as [string, ...string[]])
+        .optional()
+        .default(CommentThreadStatus[CommentThreadStatus.Active])
+        .describe("The status of the comment thread. Defaults to 'Active'."),
+      rightFileStartLine: z.number().optional().describe("Position of first character of the thread's span in right file. The line number of a thread's position. Starts at 1. (optional)"),
+      rightFileStartOffset: z
+        .number()
+        .optional()
+        .describe(
+          "Position of first character of the thread's span in right file. The line number of a thread's position. The character offset of a thread's position inside of a line. Starts at 1. Must only be set if rightFileStartLine is also specified. (optional)"
+        ),
+      rightFileEndLine: z
+        .number()
+        .optional()
+        .describe(
+          "Position of last character of the thread's span in right file. The line number of a thread's position. Starts at 1. Must only be set if rightFileStartLine is also specified. (optional)"
+        ),
+      rightFileEndOffset: z
+        .number()
+        .optional()
+        .describe(
+          "Position of last character of the thread's span in right file. The character offset of a thread's position inside of a line. Must only be set if rightFileEndLine is also specified. (optional)"
+        ),
+    },
+    async ({ repositoryId, pullRequestId, content, project, filePath, status, rightFileStartLine, rightFileStartOffset, rightFileEndLine, rightFileEndOffset }) => {
+      const connection = await connectionProvider();
+      const gitApi = await connection.getGitApi();
+
+      const normalizedFilePath = filePath && !filePath.startsWith("/") ? `/${filePath}` : filePath;
+      const threadContext: CommentThreadContext = { filePath: normalizedFilePath };
+
+      if (rightFileStartLine !== undefined) {
+        if (rightFileStartLine < 1) {
+          throw new Error("rightFileStartLine must be greater than or equal to 1.");
+        }
+
+        threadContext.rightFileStart = { line: rightFileStartLine };
+
+        if (rightFileStartOffset !== undefined) {
+          if (rightFileStartOffset < 1) {
+            throw new Error("rightFileStartOffset must be greater than or equal to 1.");
+          }
+
+          threadContext.rightFileStart.offset = rightFileStartOffset;
+        }
+      }
+
+      if (rightFileEndLine !== undefined) {
+        if (rightFileStartLine === undefined) {
+          throw new Error("rightFileEndLine must only be specified if rightFileStartLine is also specified.");
+        }
+
+        if (rightFileEndLine < 1) {
+          throw new Error("rightFileEndLine must be greater than or equal to 1.");
+        }
+
+        threadContext.rightFileEnd = { line: rightFileEndLine };
+
+        if (rightFileEndOffset !== undefined) {
+          if (rightFileEndOffset < 1) {
+            throw new Error("rightFileEndOffset must be greater than or equal to 1.");
+          }
+
+          threadContext.rightFileEnd.offset = rightFileEndOffset;
+        }
+      }
+
+      const thread = await gitApi.createThread(
+        { comments: [{ content: content }], threadContext: threadContext, status: CommentThreadStatus[status as keyof typeof CommentThreadStatus] },
+        repositoryId,
+        pullRequestId,
+        project
+      );
+
+      return {
+        content: [{ type: "text", text: JSON.stringify(thread, null, 2) }],
       };
     }
   );
@@ -481,8 +822,9 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<Acce
       repositoryId: z.string().describe("The ID of the repository where the pull request is located."),
       pullRequestId: z.number().describe("The ID of the pull request where the comment thread exists."),
       threadId: z.number().describe("The ID of the thread to be resolved."),
+      fullResponse: z.boolean().optional().default(false).describe("Return full thread JSON response instead of a simple confirmation message."),
     },
-    async ({ repositoryId, pullRequestId, threadId }) => {
+    async ({ repositoryId, pullRequestId, threadId, fullResponse }) => {
       const connection = await connectionProvider();
       const gitApi = await connection.getGitApi();
       const thread = await gitApi.updateThread(
@@ -492,8 +834,22 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<Acce
         threadId
       );
 
+      // Check if the thread was successfully resolved
+      if (!thread) {
+        return {
+          content: [{ type: "text", text: `Error: Failed to resolve thread ${threadId}. The thread status was not updated successfully.` }],
+          isError: true,
+        };
+      }
+
+      if (fullResponse) {
+        return {
+          content: [{ type: "text", text: JSON.stringify(thread, null, 2) }],
+        };
+      }
+
       return {
-        content: [{ type: "text", text: JSON.stringify(thread, null, 2) }],
+        content: [{ type: "text", text: `Thread ${threadId} was successfully resolved.` }],
       };
     }
   );

@@ -5,12 +5,15 @@ import { AccessToken } from "@azure/identity";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebApi } from "azure-devops-node-api";
 import { z } from "zod";
+import { searchIdentities } from "./auth.js";
 
 import type { ProjectInfo } from "azure-devops-node-api/interfaces/CoreInterfaces.js";
+import { IdentityBase } from "azure-devops-node-api/interfaces/IdentitiesInterfaces.js";
 
 const CORE_TOOLS = {
   list_project_teams: "core_list_project_teams",
   list_projects: "core_list_projects",
+  get_identity_ids: "core_get_identity_ids",
 };
 
 function filterProjectsByName(projects: ProjectInfo[], projectNameFilter: string): ProjectInfo[] {
@@ -18,7 +21,7 @@ function filterProjectsByName(projects: ProjectInfo[], projectNameFilter: string
   return projects.filter((project) => project.name?.toLowerCase().includes(lowerCaseFilter));
 }
 
-function configureCoreTools(server: McpServer, tokenProvider: () => Promise<AccessToken>, connectionProvider: () => Promise<WebApi>) {
+function configureCoreTools(server: McpServer, tokenProvider: () => Promise<AccessToken>, connectionProvider: () => Promise<WebApi>, userAgentProvider: () => string) {
   server.tool(
     CORE_TOOLS.list_project_teams,
     "Retrieve a list of teams for the specified Azure DevOps project.",
@@ -82,6 +85,42 @@ function configureCoreTools(server: McpServer, tokenProvider: () => Promise<Acce
 
         return {
           content: [{ type: "text", text: `Error fetching projects: ${errorMessage}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.tool(
+    CORE_TOOLS.get_identity_ids,
+    "Retrieve Azure DevOps identity IDs for a provided search filter.",
+    {
+      searchFilter: z.string().describe("Search filter (unique namme, display name, email) to retrieve identity IDs for."),
+    },
+    async ({ searchFilter }) => {
+      try {
+        const identities = await searchIdentities(searchFilter, tokenProvider, connectionProvider, userAgentProvider);
+
+        if (!identities || identities.value?.length === 0) {
+          return { content: [{ type: "text", text: "No identities found" }], isError: true };
+        }
+
+        const identitiesTrimmed = identities.value?.map((identity: IdentityBase) => {
+          return {
+            id: identity.id,
+            displayName: identity.providerDisplayName,
+            descriptor: identity.descriptor,
+          };
+        });
+
+        return {
+          content: [{ type: "text", text: JSON.stringify(identitiesTrimmed, null, 2) }],
+        };
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+
+        return {
+          content: [{ type: "text", text: `Error fetching identities: ${errorMessage}` }],
           isError: true,
         };
       }
